@@ -37,6 +37,8 @@
 #include "odrefresh/odrefresh.h"
 #include "selinux/android.h"
 #include "selinux/selinux.h"
+#include <sys/system_properties.h>
+#include <string_view>
 
 namespace {
 
@@ -202,20 +204,38 @@ int InitializeConfig(int argc, char** argv, OdrConfig* config) {
   return n;
 }
 
-void GetSystemProperties(std::unordered_map<std::string, std::string>* system_properties) {
-  SystemPropertyForeach([&](std::string_view name, const char* value) {
-    if (strlen(value) == 0) {
+// 1. Strict C-Style matching callback signature matching bionic/libc/include/sys/system_properties.h:89
+extern "C" void OdrFutureProofCallback(const prop_info* pi, void* cookie) {
+  if (pi == nullptr || cookie == nullptr) {
+    return;
+  }
+
+  // Pass processing down to the modern non-truncating reader callback interface
+  __system_property_read_callback(pi, [](void* inner_cookie, const char* name, const char* value, uint32_t) {
+    auto* props = reinterpret_cast<std::unordered_map<std::string, std::string>*>(inner_cookie);
+    if (name == nullptr || value == nullptr || strlen(value) == 0) {
       return;
     }
+
+    // Safely parse prefix rules imported from art/odrefresh/odr_config.h
+    std::string_view name_view(name);
     for (const char* prefix : kCheckedSystemPropertyPrefixes) {
-      if (name.starts_with(prefix)) {
-        (*system_properties)[std::string(name)] = value;
+      if (name_view.starts_with(prefix)) {
+        (*props)[std::string(name)] = std::string(value);
+        break;
       }
     }
-  });
+  }, cookie);
+}
+
+void GetSystemProperties(std::unordered_map<std::string, std::string>* system_properties) {
+  // 2. Safely trigger the loop utilizing the platform's native property mapping pointer array
+  __system_property_foreach(OdrFutureProofCallback, system_properties);
+
+  // 3. Keep existing fallback explicit array verification structures intact
   for (const SystemPropertyConfig& system_property_config : *kSystemProperties.get()) {
     (*system_properties)[system_property_config.name] =
-        GetProperty(system_property_config.name, system_property_config.default_value);
+        ::android::base::GetProperty(system_property_config.name, system_property_config.default_value);
   }
 }
 
